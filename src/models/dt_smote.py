@@ -1,0 +1,144 @@
+from google.cloud import aiplatform as vertex_ai
+from google.cloud import storage
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from imblearn.over_sampling import SMOTE
+import joblib
+import logging
+import argparse
+import os
+import pandas as pd
+from dotenv import load_dotenv
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+import datetime
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+default_model_path = f"gs://{os.getenv('BUCKET_NAME')}/models/fraud_dt_{timestamp}.joblib"
+
+
+
+parser = argparse.ArgumentParser(description='Train Decision Tree model')
+parser.add_argument('--train_data', type=str, required=True)
+parser.add_argument('--test_data', type=str, required=True)
+parser.add_argument('--model_output', type=str, 
+                    default=default_model_path,
+                    help='GCS path to save model')
+parser.add_argument('--max_depth', type=int, default=None)
+args = parser.parse_args()
+
+def load_data(train_path, test_path):
+    logging.info("Loading training and test data from GCS")
+    
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
+
+    train_df = train_df.dropna(subset=['target'])
+    test_df = test_df.dropna(subset=['target'])
+    
+    X_train = train_df.drop('target', axis=1)
+    y_train = train_df['target']
+    
+    X_test = test_df.drop('target', axis=1)
+    y_test = test_df['target']
+
+    return X_train, y_train, X_test, y_test
+
+
+def tune_and_train_model(X_train, y_train):
+    logger.info(f"Applying SMOTE to balance the dataset:")
+    smote = SMOTE(random_state=42)
+    X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+    logger.info(f"After SMOTE -> Train shape: {X_train_res.shape}, Fraud rate: {y_train_res.mean():.4f}")
+    logger.info("Training Decision Tree model on balanced data ")
+
+    logger.info("Starting hyperparameter tuning")
+
+    param_grid = {
+        "max_depth": [5,10,15],
+        "min_samples_split": [2,5,10],
+        "min_samples_leaf": [2,4,5],
+        'criterion': ['gini', 'entropy']
+    }
+    
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    
+    logging.info("Training Decision Tree model")
+    model = DecisionTreeClassifier( 
+        class_weight = 'balanced', 
+        random_state=42
+        )
+
+    grid_search = GridSearchCV(
+        estimator=model,
+        param_grid=param_grid,
+        cv=cv,
+        scoring='roc_auc',
+        n_jobs=-1,
+        verbose=1
+    )
+    grid_search.fit(X_train_res, y_train_res)
+    best_model = grid_search.best_estimator_
+    logger.info(f"Best parameters: {grid_search.best_params_}")
+    logger.info(f"Best CV ROC AUC: {grid_search.best_score_:.4f}")
+    return best_model
+
+def evaluate_model(best_model, X_test, y_test):
+    logging.info("Evaluating model on test data")
+    preds = best_model.predict(X_test)
+    probs = best_model.predict_proba(X_test)[:, 1]
+    
+    print("\n=== Classification Report  ===")
+    print(classification_report(y_test, preds))
+    
+    print("\n=== Confusion Matrix  ===")
+    print(confusion_matrix(y_test, preds))
+    
+    print("\n=== ROC AUC Score  ===")
+    print(f"ROC AUC Score: {roc_auc_score(y_test, probs):.4f}")
+
+def save_model(best_model, output_path):
+    logging.info(f"Saving model to {output_path}")
+    local_path = 'decision_tree_model.joblib'
+    joblib.dump(best_model, local_path)
+
+    if output_path.startswith('gs://'):
+        import urllib.parse
+        parsed = urllib.parse.urlparse(output_path)
+        bucket_name = parsed.netloc
+        blob_name = parsed.path.lstrip('/')
+
+        if not blob_name or blob_name.endswith('/'):
+            blob_name = blob_name + 'decision_tree_model.joblib'
+
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(local_path)
+
+        full_gcs_path = f"gs://{bucket_name}/{blob_name}"
+        logger.info(f"Model uploaded to GCS {full_gcs_path} successfully")
+    else:
+        joblib.dump(best_model, output_path)
+        logger.info(f"Model saved locally")
+
+
+
+if __name__ == '__main__':
+    X_train, y_train, X_test, y_test = load_data(args.train_data, args.test_data)
+    
+    model = tune_and_train_model(
+        X_train, y_train
+    )
+    
+    evaluate_model(model, X_test, y_test)
+    
+    save_model(model, args.model_output)
+    logger.info("Training completed successfully !")
+
+
